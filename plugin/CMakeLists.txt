@@ -131,6 +131,36 @@ find_package(IARMBus REQUIRED)
 target_include_directories(${PLUGIN_IMPLEMENTATION} PRIVATE ${IARMBUS_INCLUDE_DIRS})
 target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${IARMBUS_LIBRARIES})
 
+# AIDL / binder includes — mirrors AIDL_INCLUDE in the old-arch Makefile
+find_path(AIDL_INCLUDE_DIR NAMES com/rdk/hal/hdmiinput/IHDMIInputManager.h
+    PATH_SUFFIXES rdk-halif-aidl)
+find_path(BINDER_INCLUDE_DIR NAMES binder/IServiceManager.h
+    PATH_SUFFIXES binder_sdk android)
+if(AIDL_INCLUDE_DIR AND BINDER_INCLUDE_DIR)
+    target_include_directories(${PLUGIN_IMPLEMENTATION} PRIVATE
+        ${AIDL_INCLUDE_DIR}
+        ${BINDER_INCLUDE_DIR})
+else()
+    message(WARNING "AIDL or binder headers not found — AIDL path in dHdmiInImpl will be inactive")
+endif()
+
+find_library(BINDER_LIBRARY NAMES binder)
+find_library(UTILS_LIBRARY  NAMES utils)
+find_library(HAL_AIDL_LIBRARY NAMES hal_aidl)
+if(BINDER_LIBRARY)
+    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${BINDER_LIBRARY})
+endif()
+if(UTILS_LIBRARY)
+    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${UTILS_LIBRARY})
+endif()
+if(HAL_AIDL_LIBRARY)
+    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${HAL_AIDL_LIBRARY})
+endif()
+
+# Binder/AIDL generated code requires C++17; only override the files that need it
+set_source_files_properties(DeviceSettingsHdmiInImplementation.cpp HdmiIn.cpp
+    PROPERTIES COMPILE_OPTIONS "-std=gnu++17;-fpermissive")
+
 target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${DSHALSRV_LIBRARIES})
 target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${OEMHAL_LIBRARIES})
 
