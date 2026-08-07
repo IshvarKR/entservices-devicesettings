@@ -98,7 +98,7 @@ target_include_directories(${PLUGIN_IMPLEMENTATION} PRIVATE
 target_compile_definitions(${PLUGIN_IMPLEMENTATION} PRIVATE GLIB_AVAILABLE DS_AUDIO_SETTINGS_PERSISTENCE)
 
 set_target_properties(${PLUGIN_IMPLEMENTATION} PROPERTIES
-        CXX_STANDARD 11
+    CXX_STANDARD 17
         CXX_STANDARD_REQUIRED YES)
 
 #if(RDK_SERVICES_L1_TEST OR RDK_SERVICE_L2_TEST)
@@ -157,9 +157,8 @@ if(HAL_AIDL_LIBRARY)
     target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${HAL_AIDL_LIBRARY})
 endif()
 
-# Binder/AIDL generated code requires C++17; only override the files that need it
-set_source_files_properties(DeviceSettingsHdmiInImplementation.cpp HdmiIn.cpp
-    PROPERTIES COMPILE_OPTIONS "-std=gnu++17;-fpermissive")
+# Binder/AIDL headers are pulled in through dHdmiInImpl.h, so the full
+# implementation target needs C++17 rather than only a couple of sources.
 
 target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${DSHALSRV_LIBRARIES})
 target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${OEMHAL_LIBRARIES})
