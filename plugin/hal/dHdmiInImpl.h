@@ -43,6 +43,10 @@
 #include <map>
 #include <mutex>
 
+#ifdef LOG_PRI
+#undef LOG_PRI
+#endif
+
 // Binder/AIDL headers for IHDMIInput path
 #include <binder/IServiceManager.h>
 #include <binder/ProcessState.h>
