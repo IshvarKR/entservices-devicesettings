@@ -141,10 +141,10 @@ namespace Plugin {
         {
             auto tS1 = Clock::now();
             LOGINFO("[DS-INIT-TIMING] Stage1 Create (VDev+Display+Host) — begin");
-            std::thread tVDev   ([this]{ _videoDeviceSettings  = DeviceSettingsVideoDeviceImpl::Create(); });
-            std::thread tDisplay([this]{ _displaySettings      = DeviceSettingsDisplayImpl::Create(); });
-            std::thread tHost   ([this]{ _hostSettings         = DeviceSettingsHostImpl::Create(); });
-            tVDev.join(); tDisplay.join(); tHost.join();
+            // std::thread tVDev   ([this]{ _videoDeviceSettings  = DeviceSettingsVideoDeviceImpl::Create(); });
+            // std::thread tDisplay([this]{ _displaySettings      = DeviceSettingsDisplayImpl::Create(); });
+            // std::thread tHost   ([this]{ _hostSettings         = DeviceSettingsHostImpl::Create(); });
+            // tVDev.join(); tDisplay.join(); tHost.join();
             LOGINFO("[DS-INIT-TIMING] %-28s : %6lld ms", "Stage1 Create (VDev+Display+Host)",
                     (long long)std::chrono::duration_cast<Ms>(Clock::now() - tS1).count());
         }
@@ -153,12 +153,13 @@ namespace Plugin {
         {
             auto tS2 = Clock::now();
             LOGINFO("[DS-INIT-TIMING] Stage2 Create (VPort+Audio+FPD+HdmiIn+Comp) — begin");
-            std::thread tVPort ([this]{ _videoPortSettings     = DeviceSettingsVideoPortImpl::Create(); });
-            std::thread tAudio ([this]{ _audioSettings         = DeviceSettingsAudioImpl::Create(); });
-            std::thread tFPD   ([this]{ _fpdSettings           = DeviceSettingsFPDImpl::Create(); });
+            // std::thread tVPort ([this]{ _videoPortSettings     = DeviceSettingsVideoPortImpl::Create(); });
+            // std::thread tAudio ([this]{ _audioSettings         = DeviceSettingsAudioImpl::Create(); });
+            // std::thread tFPD   ([this]{ _fpdSettings           = DeviceSettingsFPDImpl::Create(); });
             std::thread tHdmi  ([this]{ _hdmiInSettings        = DeviceSettingsHdmiInImp::Create(); });
-            std::thread tComp  ([this]{ _compositeInSettings   = DeviceSettingsCompositeInImpl::Create(); });
-            tVPort.join(); tAudio.join(); tFPD.join(); tHdmi.join(); tComp.join();
+            // std::thread tComp  ([this]{ _compositeInSettings   = DeviceSettingsCompositeInImpl::Create(); });
+            // tVPort.join(); tAudio.join(); tFPD.join(); tComp.join();
+            tHdmi.join();
             LOGINFO("[DS-INIT-TIMING] %-28s : %6lld ms", "Stage2 Create (VPort+others)",
                     (long long)std::chrono::duration_cast<Ms>(Clock::now() - tS2).count());
         }
@@ -172,41 +173,41 @@ namespace Plugin {
         LOGINFO("DeviceSettingsImp Destructor - Instance Address: %p", this);
         
         // Clean up created implementation instances
-        if (_fpdSettings != nullptr) {
-            delete _fpdSettings;
-            _fpdSettings = nullptr;
-        }
+        // if (_fpdSettings != nullptr) {
+        //     delete _fpdSettings;
+        //     _fpdSettings = nullptr;
+        // }
         
         if (_hdmiInSettings != nullptr) {
             delete _hdmiInSettings;
             _hdmiInSettings = nullptr;
         }
         
-        if (_audioSettings != nullptr) {
-            delete _audioSettings;
-            _audioSettings = nullptr;
-        }
+        // if (_audioSettings != nullptr) {
+        //     delete _audioSettings;
+        //     _audioSettings = nullptr;
+        // }
         
-        if (_videoPortSettings != nullptr) {
-            delete _videoPortSettings;
-            _videoPortSettings = nullptr;
-        }
-        if (_videoDeviceSettings != nullptr) {
-            delete _videoDeviceSettings;
-            _videoDeviceSettings = nullptr;
-        }
-        if (_hostSettings != nullptr) {
-            delete _hostSettings;
-            _hostSettings = nullptr;
-        }
-        if (_displaySettings != nullptr) {
-            delete _displaySettings;
-            _displaySettings = nullptr;
-        }
-        if (_compositeInSettings != nullptr) {
-            delete _compositeInSettings;
-            _compositeInSettings = nullptr;
-        }
+        // if (_videoPortSettings != nullptr) {
+        //     delete _videoPortSettings;
+        //     _videoPortSettings = nullptr;
+        // }
+        // if (_videoDeviceSettings != nullptr) {
+        //     delete _videoDeviceSettings;
+        //     _videoDeviceSettings = nullptr;
+        // }
+        // if (_hostSettings != nullptr) {
+        //     delete _hostSettings;
+        //     _hostSettings = nullptr;
+        // }
+        // if (_displaySettings != nullptr) {
+        //     delete _displaySettings;
+        //     _displaySettings = nullptr;
+        // }
+        // if (_compositeInSettings != nullptr) {
+        //     delete _compositeInSettings;
+        //     _compositeInSettings = nullptr;
+        // }
         
         // Clean up DSController last as it provides system infrastructure
         if (_dsController != nullptr) {
