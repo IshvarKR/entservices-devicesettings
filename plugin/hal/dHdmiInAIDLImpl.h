@@ -832,10 +832,8 @@ public:
 
         int port_no = (int)hdmiPort;
         if (port_no >= 0 && port_no < dsHDMI_IN_PORT_MAX) {
-            char edidVer[2];
-            sprintf(edidVer, "%d", ver);
             std::string key = "HDMI" + std::to_string(port_no) + ".edidversion";
-            device::HostPersistence::getInstance().persistHostProperty(key, edidVer);
+            device::HostPersistence::getInstance().persistHostProperty(key, std::to_string(static_cast<int>(ver)));
             m_edidversion[port_no] = ver;
         }
         LOGINFO("SetHDMIEdidVersion: port=%d, version=%d (AIDL)", (int)hdmiPort, ver);
