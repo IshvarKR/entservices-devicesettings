@@ -30,7 +30,7 @@ namespace Plugin {
         _CompositeInNotifications(),
         _apiLock(),
         _callbackLock(),
-        _compositeIn(CompositeIn::Create<dCompositeInImpl>(*this))
+        _compositeIn(CompositeIn::Create(*this))
     {
         LOGINFO("DeviceSettingsCompositeInImpl Constructor - Instance Address: %p", this);
     }
