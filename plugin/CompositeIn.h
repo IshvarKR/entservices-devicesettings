@@ -41,6 +41,8 @@
 
 #include "hal/dCompositeIn.h"
 #include "hal/dCompositeInImpl.h"
+#include "hal/dCompositeInAIDLImpl.h"
+#include "hal/dHdmiInAIDLImpl.h"
 #include "DeviceSettingsTypes.h"
 
 class CompositeIn {
@@ -81,6 +83,22 @@ private:
     INotification& _parent;
 
 public:
+    static CompositeIn Create(INotification& parent)
+    {
+        ENTRY_LOG;
+        std::shared_ptr<IPlatform> impl;
+        if (dHdmiInAIDLImpl::IsAIDLAvailable()) {
+            LOGINFO("CompositeIn::Create - AIDL HAL is available, using dCompositeInAIDLImpl");
+            impl = std::shared_ptr<dCompositeInAIDLImpl>(new dCompositeInAIDLImpl());
+        } else {
+            LOGINFO("CompositeIn::Create - AIDL HAL not available, using legacy dCompositeInImpl");
+            impl = std::shared_ptr<DefaultImpl>(new DefaultImpl());
+        }
+        ASSERT(impl != nullptr);
+        EXIT_LOG;
+        return CompositeIn(parent, std::move(impl));
+    }
+
     template <typename IMPL = DefaultImpl, typename... Args>
     static CompositeIn Create(INotification& parent, Args&&... args)
     {
