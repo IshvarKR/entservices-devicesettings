@@ -41,6 +41,8 @@
 
 #include "hal/dVideoPort.h"
 #include "hal/dVideoPortImpl.h"
+#include "hal/dVideoPortAIDLImpl.h"
+#include "hal/dHdmiInAIDLImpl.h"
 #include "DeviceSettingsTypes.h"
 
 class VideoPort {
@@ -111,6 +113,22 @@ public:
     void OnResolutionPostChange(const ResolutionChange resolution);
     void OnHDCPStatusChange(const VideoPortHdcpStatus hdcpStatus);
     void OnVideoFormatUpdate(const HDRStandard videoFormatHDR);
+
+    static VideoPort Create(INotification& parent)
+    {
+        ENTRY_LOG;
+        std::shared_ptr<IPlatform> impl;
+        if (dHdmiInAIDLImpl::IsAIDLAvailable()) {
+            LOGINFO("VideoPort::Create - AIDL HAL is available, using dVideoPortAIDLImpl");
+            impl = std::shared_ptr<dVideoPortAIDLImpl>(new dVideoPortAIDLImpl());
+        } else {
+            LOGINFO("VideoPort::Create - AIDL HAL not available, using legacy dVideoPortImpl");
+            impl = std::shared_ptr<DefaultImpl>(new DefaultImpl());
+        }
+        ASSERT(impl != nullptr);
+        EXIT_LOG;
+        return VideoPort(parent, std::move(impl));
+    }
 
     template <typename IMPL = DefaultImpl, typename... Args>
     static VideoPort Create(INotification& parent, Args&&... args)
