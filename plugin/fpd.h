@@ -41,6 +41,8 @@
 
 #include "hal/dFPD.h"
 #include "hal/dFPDImpl.h"
+#include "hal/dFPDAIDLImpl.h"
+#include "hal/dHdmiInAIDLImpl.h"
 #include "DeviceSettingsTypes.h"
 
 class FPD {
@@ -78,6 +80,22 @@ public:
     uint32_t GetFPDTimeFormat(FPDTimeFormat &fpdTimeFormat);
     uint32_t SetFPDTimeFormat(const FPDTimeFormat fpdTimeFormat);
     uint32_t SetFPDMode(const FPDMode fpdMode);
+
+    static FPD Create(INotification& parent)
+    {
+        ENTRY_LOG;
+        std::shared_ptr<IPlatform> impl;
+        if (dHdmiInAIDLImpl::IsAIDLAvailable()) {
+            LOGINFO("FPD::Create - AIDL HAL is available, using dFPDAIDLImpl");
+            impl = std::shared_ptr<dFPDAIDLImpl>(new dFPDAIDLImpl());
+        } else {
+            LOGINFO("FPD::Create - AIDL HAL not available, using legacy dFPDImpl");
+            impl = std::shared_ptr<DefaultImpl>(new DefaultImpl());
+        }
+        ASSERT(impl != nullptr);
+        EXIT_LOG;
+        return FPD(parent, std::move(impl));
+    }
 
     template <typename IMPL = DefaultImpl, typename... Args>
     static FPD Create(INotification& parent, Args&&... args)
