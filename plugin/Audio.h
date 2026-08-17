@@ -41,6 +41,7 @@
 #include "hal/dAudio.h"
 #include "hal/dAudioImpl.h"
 #include "hal/dAudioAIDLImpl.h"
+#include "hal/dHdmiInAIDLImpl.h"
 #include "DeviceSettingsTypes.h"
 
 using namespace WPEFramework::Exchange;
@@ -232,7 +233,7 @@ public:
     {
         ENTRY_LOG;
         std::shared_ptr<IPlatform> impl;
-        if (dAudioAIDLImpl::IsAIDLAvailable()) {
+        if (dHdmiInAIDLImpl::IsAIDLAvailable()) {
             LOGINFO("Audio::Create - AIDL HAL is available, using dAudioAIDLImpl");
             impl = std::shared_ptr<dAudioAIDLImpl>(new dAudioAIDLImpl());
         } else {
