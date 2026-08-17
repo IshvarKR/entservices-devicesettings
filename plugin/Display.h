@@ -41,6 +41,8 @@
 
 #include "hal/dDisplay.h"
 #include "hal/dDisplayImpl.h"
+#include "hal/dDisplayAIDLImpl.h"
+#include "hal/dHdmiInAIDLImpl.h"
 #include "DeviceSettingsTypes.h"
 
 class Display {
@@ -78,6 +80,22 @@ public:
     void OnDisplayRxSense(const DisplayEvent displayEvent);
     void OnDisplayHDCPStatus();
     void OnDisplayHDMIHotPlug(const DisplayEvent displayEvent);
+
+    static Display Create(INotification& parent)
+    {
+        ENTRY_LOG;
+        std::shared_ptr<IPlatform> impl;
+        if (dHdmiInAIDLImpl::IsAIDLAvailable()) {
+            LOGINFO("Display::Create - AIDL HAL is available, using dDisplayAIDLImpl");
+            impl = std::shared_ptr<dDisplayAIDLImpl>(new dDisplayAIDLImpl());
+        } else {
+            LOGINFO("Display::Create - AIDL HAL not available, using legacy dDisplayImpl");
+            impl = std::shared_ptr<DefaultImpl>(new DefaultImpl());
+        }
+        ASSERT(impl != nullptr);
+        EXIT_LOG;
+        return Display(parent, std::move(impl));
+    }
 
     template <typename IMPL = DefaultImpl, typename... Args>
     static Display Create(INotification& parent, Args&&... args)
