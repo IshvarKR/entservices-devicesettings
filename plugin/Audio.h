@@ -40,6 +40,7 @@
 
 #include "hal/dAudio.h"
 #include "hal/dAudioImpl.h"
+#include "hal/dAudioAIDLImpl.h"
 #include "DeviceSettingsTypes.h"
 
 using namespace WPEFramework::Exchange;
@@ -226,6 +227,22 @@ public:
     void OnAudioFormatUpdate(AudioFormat audioFormat);
     void OnAudioOutHotPlug(AudioPortType portType, uint32_t portNumber, bool isPortConnected);
     void OnDolbyAtmosCapabilitiesChanged(DolbyAtmosCapability atmosCapability, bool status);
+
+    static Audio Create(INotification& parent)
+    {
+        ENTRY_LOG;
+        std::shared_ptr<IPlatform> impl;
+        if (dAudioAIDLImpl::IsAIDLAvailable()) {
+            LOGINFO("Audio::Create - AIDL HAL is available, using dAudioAIDLImpl");
+            impl = std::shared_ptr<dAudioAIDLImpl>(new dAudioAIDLImpl());
+        } else {
+            LOGINFO("Audio::Create - AIDL HAL not available, using legacy dAudioImpl");
+            impl = std::shared_ptr<DefaultImpl>(new DefaultImpl());
+        }
+        ASSERT(impl != nullptr);
+        EXIT_LOG;
+        return Audio(parent, std::move(impl));
+    }
 
     template <typename IMPL = DefaultImpl, typename... Args>
     static Audio Create(INotification& parent, Args&&... args)
