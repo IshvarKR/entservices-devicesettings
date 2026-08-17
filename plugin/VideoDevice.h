@@ -40,6 +40,8 @@
 
 #include "hal/dVideoDevice.h"
 #include "hal/dVideoDeviceImpl.h"
+#include "hal/dVideoDeviceAIDLImpl.h"
+#include "hal/dHdmiInAIDLImpl.h"
 #include "DeviceSettingsTypes.h"
 
 class VideoDevice {
@@ -80,6 +82,22 @@ public:
     void OnZoomSettingsChanged(const VideoDeviceZoom zoomSetting);
     void OnDisplayFrameratePreChange(const string frameRate);
     void OnDisplayFrameratePostChange(const string frameRate);
+
+    static VideoDevice Create(INotification& parent)
+    {
+        ENTRY_LOG;
+        std::shared_ptr<IPlatform> impl;
+        if (dHdmiInAIDLImpl::IsAIDLAvailable()) {
+            LOGINFO("VideoDevice::Create - AIDL HAL is available, using dVideoDeviceAIDLImpl");
+            impl = std::shared_ptr<dVideoDeviceAIDLImpl>(new dVideoDeviceAIDLImpl());
+        } else {
+            LOGINFO("VideoDevice::Create - AIDL HAL not available, using legacy dVideoDeviceImpl");
+            impl = std::shared_ptr<DefaultImpl>(new DefaultImpl());
+        }
+        ASSERT(impl != nullptr);
+        EXIT_LOG;
+        return VideoDevice(parent, std::move(impl));
+    }
 
     template <typename IMPL = DefaultImpl, typename... Args>
     static VideoDevice Create(INotification& parent, Args&&... args)
