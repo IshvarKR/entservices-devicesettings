@@ -149,7 +149,7 @@ public:
      * @endcode
      */
     template <typename IMPL = DefaultImpl, typename... Args>
-    static HdmiIn CreateExplicit(INotification& parent, Args&&... args)
+    static HdmiIn Create(INotification& parent, Args&&... args)
     {
         ENTRY_LOG;
         static_assert(std::is_base_of<IPlatform, IMPL>::value, "Impl must derive from hal::dHdmiIn::IPlatform");
