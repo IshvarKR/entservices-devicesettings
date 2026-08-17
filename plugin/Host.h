@@ -31,6 +31,8 @@
 
 #include "hal/dHost.h"
 #include "hal/dHostImpl.h"
+#include "hal/dHostAIDLImpl.h"
+#include "hal/dHdmiInAIDLImpl.h"
 #include "DeviceSettingsTypes.h"
 
 class Host {
@@ -42,7 +44,21 @@ class Host {
 public:
     Host(std::shared_ptr<IPlatform> platform = nullptr);
 
-    static Host Create();
+    static Host Create()
+    {
+        ENTRY_LOG;
+        std::shared_ptr<IPlatform> impl;
+        if (dHdmiInAIDLImpl::IsAIDLAvailable()) {
+            LOGINFO("Host::Create - AIDL HAL is available, using dHostAIDLImpl");
+            impl = std::shared_ptr<dHostAIDLImpl>(new dHostAIDLImpl());
+        } else {
+            LOGINFO("Host::Create - AIDL HAL not available, using legacy dHostImpl");
+            impl = std::shared_ptr<DefaultImpl>(new DefaultImpl());
+        }
+        ASSERT(impl != nullptr);
+        EXIT_LOG;
+        return Host(std::move(impl));
+    }
 
     Host(const Host&) = default;
     Host& operator=(const Host&) = default;
