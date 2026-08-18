@@ -612,7 +612,7 @@ public:
                 portStatuses.push_back(ps);
             }
         }
-        portConnectionStatus = WPEFramework::Core::Service<WPEFramework::RPC::IteratorType<IHDMIInPortConnectionStatusIterator>>::Create<IHDMIInPortConnectionStatusIterator>(portStatuses);
+        portConnectionStatus = WPEFramework::Core::Service<WPEFramework::RPC::IIteratorType<IHDMIInPortConnectionStatusIterator>>::Create<IHDMIInPortConnectionStatusIterator>(portStatuses);
         LOGINFO("GetHDMIInStatus (AIDL): activePort=%d isPresented=%s", m_aidlActivePort, hdmiStatus.isPresented ? "true" : "false");
         return WPEFramework::Core::ERROR_NONE;
     }
