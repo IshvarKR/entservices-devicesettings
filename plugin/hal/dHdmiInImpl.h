@@ -845,7 +845,7 @@ public:
                 portStatuses.push_back(ps);
                 LOGINFO("GetHDMIInStatus: port[%d] isPortConnected=%s", p, ps.isPortConnected ? "true" : "false");
             }
-            portConnectionStatus = WPEFramework::Core::Service<WPEFramework::RPC::IteratorType<IHDMIInPortConnectionStatusIterator>>::Create<IHDMIInPortConnectionStatusIterator>(portStatuses);
+            portConnectionStatus = WPEFramework::Core::Service<WPEFramework::RPC::IIteratorType<IHDMIInPortConnectionStatusIterator>>::Create<IHDMIInPortConnectionStatusIterator>(portStatuses);
 
             retCode = WPEFramework::Core::ERROR_NONE;
         }
