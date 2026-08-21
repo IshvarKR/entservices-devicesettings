@@ -140,21 +140,24 @@ if(AIDL_INCLUDE_DIR AND BINDER_INCLUDE_DIR)
         ${AIDL_INCLUDE_DIR}
         ${BINDER_INCLUDE_DIR})
 else()
-    message(WARNING "AIDL or Binder headers not found for dHdmiInAIDLImpl")
+    message(FATAL_ERROR "AIDL or Binder headers not found for dHdmiInAIDLImpl")
 endif()
 
 find_library(BINDER_LIBRARY NAMES binder)
 find_library(UTILS_LIBRARY NAMES utils)
 find_library(HAL_AIDL_LIBRARY NAMES hal_aidl)
-if(BINDER_LIBRARY)
-    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${BINDER_LIBRARY})
+if(NOT BINDER_LIBRARY OR NOT UTILS_LIBRARY OR NOT HAL_AIDL_LIBRARY)
+    message(FATAL_ERROR "binder/utils/hal_aidl libraries not found; hdmiinput AIDL symbols would stay unresolved")
 endif()
-if(UTILS_LIBRARY)
-    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${UTILS_LIBRARY})
-endif()
-if(HAL_AIDL_LIBRARY)
-    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${HAL_AIDL_LIBRARY})
-endif()
+
+# hal_aidl only supplies generated AIDL symbols, so keep it out of --as-needed pruning.
+target_link_libraries(${PLUGIN_IMPLEMENTATION}
+    PRIVATE
+        -Wl,--no-as-needed
+        ${HAL_AIDL_LIBRARY}
+        -Wl,--as-needed
+        ${BINDER_LIBRARY}
+        ${UTILS_LIBRARY})
 
 target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${DSHALSRV_LIBRARIES})
 target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${OEMHAL_LIBRARIES})
