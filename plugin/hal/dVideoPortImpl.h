@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <dlfcn.h>
 #include <iostream>
@@ -37,6 +38,510 @@
 #include "DeviceSettingsHALConfig.h"
 #include "DeviceSettingsHdmiStatus.h"
 #include "DeviceSettingsTelemetry.h"
+
+#ifdef LOG_PRI
+#undef LOG_PRI
+#endif
+
+#include <binder/IServiceManager.h>
+#include <binder/ProcessState.h>
+#include <com/rdk/hal/PropertyValue.h>
+#include <com/rdk/hal/hdmioutput/BnHDMIOutputControllerListener.h>
+#include <com/rdk/hal/hdmioutput/BnHDMIOutputEventListener.h>
+#include <com/rdk/hal/hdmioutput/Capabilities.h>
+#include <com/rdk/hal/hdmioutput/HDCPProtocolVersion.h>
+#include <com/rdk/hal/hdmioutput/HDCPStatus.h>
+#include <com/rdk/hal/hdmioutput/HDROutputMode.h>
+#include <com/rdk/hal/hdmioutput/IHDMIOutputManager.h>
+#include <com/rdk/hal/hdmioutput/Property.h>
+#include <com/rdk/hal/hdmioutput/State.h>
+#include <utils/String16.h>
+
+#include <functional>
+#include <iterator>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+namespace DeviceSettingsAidl {
+
+using android::sp;
+using com::rdk::hal::PropertyValue;
+using com::rdk::hal::hdmioutput::Capabilities;
+using com::rdk::hal::hdmioutput::HDCPProtocolVersion;
+using com::rdk::hal::hdmioutput::HDCPStatus;
+using com::rdk::hal::hdmioutput::HDROutputMode;
+using com::rdk::hal::hdmioutput::IHDMIOutput;
+using com::rdk::hal::hdmioutput::IHDMIOutputController;
+using com::rdk::hal::hdmioutput::IHDMIOutputControllerListener;
+using com::rdk::hal::hdmioutput::IHDMIOutputEventListener;
+using com::rdk::hal::hdmioutput::IHDMIOutputManager;
+using com::rdk::hal::hdmioutput::Property;
+using com::rdk::hal::hdmioutput::State;
+
+struct Callbacks {
+    std::function<void(int, bool)> onHotPlug;
+    std::function<void(int, State, State)> onState;
+    std::function<void(int, HDCPStatus, HDCPProtocolVersion)> onHdcp;
+    std::function<void(int)> onFrameRate;
+    std::function<void(int, const std::vector<uint8_t>&)> onEdid;
+};
+
+struct Port {
+    IHDMIOutput::Id id;
+    sp<IHDMIOutput> output;
+    sp<IHDMIOutputController> controller;
+    sp<IHDMIOutputControllerListener> controllerListener;
+    sp<IHDMIOutputEventListener> eventListener;
+    Capabilities capabilities;
+    std::vector<uint8_t> edid;
+    bool connected{false};
+    bool started{false};
+    bool eventRegistered{false};
+};
+
+inline std::mutex g_mutex;
+inline sp<IHDMIOutputManager> g_manager;
+inline std::map<int, Port> g_ports;
+inline Callbacks g_callbacks;
+inline unsigned int g_references{0};
+
+template <typename... Args>
+inline void mergeCallback(std::function<void(Args...)>& target,
+    const std::function<void(Args...)>& addition)
+{
+    if (!addition) {
+        return;
+    }
+    if (!target) {
+        target = addition;
+        return;
+    }
+    std::function<void(Args...)> existing = target;
+    target = [existing, addition](Args... args) {
+        existing(args...);
+        addition(args...);
+    };
+}
+
+inline void updateConnected(int handle, bool connected)
+{
+    std::function<void(int, bool)> callback;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_ports.find(handle);
+        if (it != g_ports.end()) {
+            it->second.connected = connected;
+        }
+        callback = g_callbacks.onHotPlug;
+    }
+    if (callback) {
+        callback(handle, connected);
+    }
+}
+
+class ControllerListener : public ::com::rdk::hal::hdmioutput::BnHDMIOutputControllerListener {
+public:
+    explicit ControllerListener(int handle)
+        : m_handle(handle)
+    {
+    }
+
+    ::android::binder::Status onHotPlugDetectStateChanged(bool state) override
+    {
+        updateConnected(m_handle, state);
+        return ::android::binder::Status::ok();
+    }
+
+    ::android::binder::Status onFrameRateChanged() override
+    {
+        std::function<void(int)> callback;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            callback = g_callbacks.onFrameRate;
+        }
+        if (callback) {
+            callback(m_handle);
+        }
+        return ::android::binder::Status::ok();
+    }
+
+    ::android::binder::Status onHDCPStatusChanged(HDCPStatus status,
+        HDCPProtocolVersion version) override
+    {
+        std::function<void(int, HDCPStatus, HDCPProtocolVersion)> callback;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            callback = g_callbacks.onHdcp;
+        }
+        if (callback) {
+            callback(m_handle, status, version);
+        }
+        return ::android::binder::Status::ok();
+    }
+
+    ::android::binder::Status onEDID(const std::vector<uint8_t>& edid) override
+    {
+        std::function<void(int, const std::vector<uint8_t>&)> callback;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_ports.find(m_handle);
+            if (it != g_ports.end()) {
+                it->second.edid = edid;
+            }
+            callback = g_callbacks.onEdid;
+        }
+        if (callback) {
+            callback(m_handle, edid);
+        }
+        return ::android::binder::Status::ok();
+    }
+
+private:
+    int m_handle;
+};
+
+class EventListener : public ::com::rdk::hal::hdmioutput::BnHDMIOutputEventListener {
+public:
+    explicit EventListener(int handle)
+        : m_handle(handle)
+    {
+    }
+
+    ::android::binder::Status onStateChanged(State oldState, State newState) override
+    {
+        const bool connected = newState == State::STARTED;
+        updateConnected(m_handle, connected);
+
+        std::function<void(int, State, State)> callback;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            callback = g_callbacks.onState;
+        }
+        if (callback) {
+            callback(m_handle, oldState, newState);
+        }
+        return ::android::binder::Status::ok();
+    }
+
+private:
+    int m_handle;
+};
+
+inline sp<IHDMIOutputManager> manager()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_manager) {
+        ::android::ProcessState::self()->startThreadPool();
+        sp<::android::IServiceManager> serviceManager = ::android::defaultServiceManager();
+        if (serviceManager) {
+            g_manager = ::android::interface_cast<IHDMIOutputManager>(
+                serviceManager->getService(
+                    ::android::String16(IHDMIOutputManager::serviceName().c_str())));
+        }
+    }
+    return g_manager;
+}
+
+inline bool initialize()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_ports.empty()) {
+            return true;
+        }
+    }
+
+    sp<IHDMIOutputManager> outputManager = manager();
+    if (!outputManager) {
+        return false;
+    }
+
+    std::vector<IHDMIOutput::Id> ids;
+    if (!outputManager->getHDMIOutputIds(&ids).isOk()) {
+        return false;
+    }
+
+    for (const auto& id : ids) {
+        sp<IHDMIOutput> output;
+        if (!outputManager->getHDMIOutput(id, &output).isOk() || !output) {
+            continue;
+        }
+
+        Port port;
+        port.id = id;
+        port.output = output;
+        output->getCapabilities(&port.capabilities);
+        port.controllerListener = sp<ControllerListener>::make(id.value);
+        port.eventListener = sp<EventListener>::make(id.value);
+
+        if (!output->open(port.controllerListener, &port.controller).isOk() || !port.controller) {
+            continue;
+        }
+
+        bool registered = false;
+        if (!output->registerEventListener(port.eventListener, &registered).isOk() || !registered) {
+            bool ignored = false;
+            output->close(port.controller, &ignored);
+            continue;
+        }
+        port.eventRegistered = true;
+
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_ports.emplace(id.value, port);
+        }
+
+        if (!port.controller->start().isOk()) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_ports.erase(id.value);
+            bool ignored = false;
+            output->unregisterEventListener(port.eventListener, &ignored);
+            output->close(port.controller, &ignored);
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_ports.find(id.value);
+            if (it != g_ports.end()) {
+                it->second.started = true;
+            }
+        }
+    }
+
+    return !g_ports.empty();
+}
+
+inline bool acquire()
+{
+    if (!initialize()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_references;
+    return true;
+}
+
+inline void shutdown()
+{
+    std::map<int, Port> ports;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        ports.swap(g_ports);
+        g_manager = nullptr;
+    }
+
+    for (auto& entry : ports) {
+        Port& port = entry.second;
+        if (port.started && port.controller) {
+            port.controller->stop();
+        }
+        if (port.output && port.eventRegistered && port.eventListener) {
+            bool ignored = false;
+            port.output->unregisterEventListener(port.eventListener, &ignored);
+        }
+        if (port.output && port.controller) {
+            bool ignored = false;
+            port.output->close(port.controller, &ignored);
+        }
+    }
+}
+
+inline void release()
+{
+    bool shouldShutdown = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_references > 0) {
+            --g_references;
+        }
+        shouldShutdown = g_references == 0 && !g_ports.empty();
+    }
+    if (shouldShutdown) {
+        shutdown();
+    }
+}
+
+inline bool setCallbacks(const Callbacks& callbacks)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    mergeCallback(g_callbacks.onHotPlug, callbacks.onHotPlug);
+    mergeCallback(g_callbacks.onState, callbacks.onState);
+    mergeCallback(g_callbacks.onHdcp, callbacks.onHdcp);
+    mergeCallback(g_callbacks.onFrameRate, callbacks.onFrameRate);
+    mergeCallback(g_callbacks.onEdid, callbacks.onEdid);
+    return !g_ports.empty();
+}
+
+inline bool getPort(int handle, Port& port)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_ports.find(handle);
+    if (it == g_ports.end()) {
+        return false;
+    }
+    port = it->second;
+    return true;
+}
+
+inline bool getHandleByIndex(int index, int& handle)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (index < 0 || static_cast<size_t>(index) >= g_ports.size()) {
+        return false;
+    }
+    auto it = g_ports.begin();
+    std::advance(it, index);
+    handle = it->first;
+    return true;
+}
+
+inline bool getProperty(int handle, Property property, std::optional<PropertyValue>& value)
+{
+    Port port;
+    return getPort(handle, port) && port.output->getProperty(property, &value).isOk() && value.has_value();
+}
+
+inline bool setProperty(int handle, Property property, const PropertyValue& value)
+{
+    Port port;
+    bool result = false;
+    return getPort(handle, port) && port.controller &&
+        port.controller->setProperty(property, value, &result).isOk() && result;
+}
+
+inline bool getCapabilities(int handle, Capabilities& capabilities)
+{
+    Port port;
+    if (!getPort(handle, port) || !port.output) {
+        return false;
+    }
+    capabilities = port.capabilities;
+    return true;
+}
+
+inline bool getHotPlugState(int handle, bool& connected)
+{
+    Port port;
+    if (!getPort(handle, port) || !port.controller) {
+        return false;
+    }
+    return port.controller->getHotPlugDetectState(&connected).isOk();
+}
+
+inline bool getStarted(int handle, bool& started)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_ports.find(handle);
+    if (it == g_ports.end()) {
+        return false;
+    }
+    started = it->second.started;
+    return true;
+}
+
+inline bool start(int handle)
+{
+    Port port;
+    if (!getPort(handle, port) || !port.controller || !port.controller->start().isOk()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_ports.find(handle);
+    if (it != g_ports.end()) {
+        it->second.started = true;
+    }
+    return true;
+}
+
+inline bool stop(int handle)
+{
+    Port port;
+    if (!getPort(handle, port) || !port.controller || !port.controller->stop().isOk()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_ports.find(handle);
+    if (it != g_ports.end()) {
+        it->second.started = false;
+    }
+    return true;
+}
+
+inline bool getHDCPStatus(int handle, HDCPStatus& status)
+{
+    Port port;
+    if (!getPort(handle, port) || !port.controller) {
+        return false;
+    }
+    return port.controller->getHDCPStatus(&status).isOk();
+}
+
+inline bool getHDCPReceiverVersion(int handle, HDCPProtocolVersion& version)
+{
+    Port port;
+    if (!getPort(handle, port) || !port.controller) {
+        return false;
+    }
+    return port.controller->getHDCPReceiverVersion(&version).isOk();
+}
+
+inline bool getHDCPCurrentVersion(int handle, HDCPProtocolVersion& version)
+{
+    Port port;
+    if (!getPort(handle, port) || !port.controller) {
+        return false;
+    }
+    return port.controller->getHDCPCurrentVersion(&version).isOk();
+}
+
+inline bool getEdid(int handle, std::vector<uint8_t>& edid)
+{
+    Port port;
+    if (!getPort(handle, port)) {
+        return false;
+    }
+    edid = port.edid;
+    return !edid.empty();
+}
+
+inline PropertyValue intProperty(int32_t value)
+{
+    PropertyValue propertyValue;
+    propertyValue.value = PropertyValue::Value(value);
+    return propertyValue;
+}
+
+inline PropertyValue boolProperty(bool value)
+{
+    PropertyValue propertyValue;
+    propertyValue.value = PropertyValue::Value(value);
+    return propertyValue;
+}
+
+inline bool getIntProperty(const std::optional<PropertyValue>& propertyValue, int32_t& value)
+{
+    if (!propertyValue || !propertyValue->value ||
+        propertyValue->value->getTag() != PropertyValue::Value::Tag::intValue) {
+        return false;
+    }
+    value = propertyValue->value->get<PropertyValue::Value::Tag::intValue>();
+    return true;
+}
+
+inline bool getBoolProperty(const std::optional<PropertyValue>& propertyValue, bool& value)
+{
+    if (!propertyValue || !propertyValue->value ||
+        propertyValue->value->getTag() != PropertyValue::Value::Tag::booleanValue) {
+        return false;
+    }
+    value = propertyValue->value->get<PropertyValue::Value::Tag::booleanValue>();
+    return true;
+}
+
+} // namespace DeviceSettingsAidl
 
 // Resolution defaults — matches dsVideoPort.c naming
 #define DS_VP_DEFAULT_RESOLUTION       "720p"
@@ -62,6 +567,212 @@ static std::function<void(const ResolutionChange)> g_VideoPortResolutionPreChang
 static std::function<void(const ResolutionChange)> g_VideoPortResolutionPostChangeCallback;
 static std::function<void(const VideoPortHdcpStatus)> g_VideoPortHDCPStatusChangeCallback;
 static std::function<void(const HDRStandard)> g_VideoPortVideoFormatUpdateCallback;
+
+static void aidlVicToVideoPortResolution(const int vic, dsVideoPortResolution_t& resolution)
+{
+    memset(&resolution, 0, sizeof(resolution));
+    resolution.aspectRatio = dsVIDEO_ASPECT_RATIO_16x9;
+    resolution.stereoScopicMode = dsVIDEO_SSMODE_2D;
+
+    switch (vic) {
+        case 1:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_720x480;
+            resolution.aspectRatio = dsVIDEO_ASPECT_RATIO_4x3;
+            resolution.frameRate = dsVIDEO_FRAMERATE_59dot94;
+            break;
+        case 2:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_720x480;
+            resolution.frameRate = dsVIDEO_FRAMERATE_59dot94;
+            break;
+        case 4:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1280x720;
+            resolution.frameRate = dsVIDEO_FRAMERATE_59dot94;
+            break;
+        case 5:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            resolution.interlaced = true;
+            resolution.frameRate = dsVIDEO_FRAMERATE_59dot94;
+            break;
+        case 16:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            resolution.frameRate = dsVIDEO_FRAMERATE_59dot94;
+            break;
+        case 17:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_720x576;
+            resolution.aspectRatio = dsVIDEO_ASPECT_RATIO_4x3;
+            resolution.frameRate = dsVIDEO_FRAMERATE_50;
+            break;
+        case 18:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_720x576;
+            resolution.frameRate = dsVIDEO_FRAMERATE_50;
+            break;
+        case 19:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1280x720;
+            resolution.frameRate = dsVIDEO_FRAMERATE_50;
+            break;
+        case 31:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            resolution.frameRate = dsVIDEO_FRAMERATE_50;
+            break;
+        case 32:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            resolution.frameRate = dsVIDEO_FRAMERATE_24;
+            break;
+        case 33:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            resolution.frameRate = dsVIDEO_FRAMERATE_25;
+            break;
+        case 34:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            resolution.frameRate = dsVIDEO_FRAMERATE_30;
+            break;
+        case 93:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_3840x2160;
+            resolution.frameRate = dsVIDEO_FRAMERATE_24;
+            break;
+        case 94:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_3840x2160;
+            resolution.frameRate = dsVIDEO_FRAMERATE_25;
+            break;
+        case 95:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_3840x2160;
+            resolution.frameRate = dsVIDEO_FRAMERATE_30;
+            break;
+        case 96:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_3840x2160;
+            resolution.frameRate = dsVIDEO_FRAMERATE_50;
+            break;
+        case 97:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_3840x2160;
+            resolution.frameRate = dsVIDEO_FRAMERATE_59dot94;
+            break;
+        default:
+            resolution.pixelResolution = dsVIDEO_PIXELRES_1920x1080;
+            resolution.frameRate = dsVIDEO_FRAMERATE_59dot94;
+            break;
+    }
+}
+
+static int videoPortResolutionToAidlVic(const VideoPortResolution& resolution)
+{
+    switch (resolution.pixelResolution) {
+        case VideoResolution::DS_VIDEO_PIXELRES_720X480:
+            return resolution.aspectRatio == VideoAspectRatio::DS_VIDEO_ASPECT_RATIO_4X3 ? 1 : 2;
+        case VideoResolution::DS_VIDEO_PIXELRES_720X576:
+            return resolution.aspectRatio == VideoAspectRatio::DS_VIDEO_ASPECT_RATIO_4X3 ? 17 : 18;
+        case VideoResolution::DS_VIDEO_PIXELRES_1280X720:
+            return resolution.frameRate == VideoFrameRate::DS_VIDEO_FRAMERATE_50 ? 19 : 4;
+        case VideoResolution::DS_VIDEO_PIXELRES_1920X1080:
+            if (resolution.interlaced) {
+                return resolution.frameRate == VideoFrameRate::DS_VIDEO_FRAMERATE_50 ? 20 : 5;
+            }
+            switch (resolution.frameRate) {
+                case VideoFrameRate::DS_VIDEO_FRAMERATE_24: return 32;
+                case VideoFrameRate::DS_VIDEO_FRAMERATE_25: return 33;
+                case VideoFrameRate::DS_VIDEO_FRAMERATE_30: return 34;
+                case VideoFrameRate::DS_VIDEO_FRAMERATE_50: return 31;
+                default: return 16;
+            }
+        case VideoResolution::DS_VIDEO_PIXELRES_3840X2160:
+            switch (resolution.frameRate) {
+                case VideoFrameRate::DS_VIDEO_FRAMERATE_24: return 93;
+                case VideoFrameRate::DS_VIDEO_FRAMERATE_25: return 94;
+                case VideoFrameRate::DS_VIDEO_FRAMERATE_30: return 95;
+                case VideoFrameRate::DS_VIDEO_FRAMERATE_50: return 96;
+                default: return 97;
+            }
+        default:
+            return 16;
+    }
+}
+
+static VideoPortHdcpStatus aidlHdcpStatusToLegacy(const DeviceSettingsAidl::HDCPStatus status)
+{
+    switch (status) {
+        case DeviceSettingsAidl::HDCPStatus::UNAUTHENTICATED:
+            return VideoPortHdcpStatus::DS_HDCP_STATUS_UNAUTHENTICATED;
+        case DeviceSettingsAidl::HDCPStatus::AUTHENTICATED:
+            return VideoPortHdcpStatus::DS_HDCP_STATUS_AUTHENTICATED;
+        case DeviceSettingsAidl::HDCPStatus::AUTHENTICATION_IN_PROGRESS:
+            return VideoPortHdcpStatus::DS_HDCP_STATUS_INPROGRESS;
+        case DeviceSettingsAidl::HDCPStatus::AUTHENTICATION_FAILURE:
+            return VideoPortHdcpStatus::DS_HDCP_STATUS_AUTHENTICATIONFAILURE;
+        default:
+            return VideoPortHdcpStatus::DS_HDCP_STATUS_UNPOWERED;
+    }
+}
+
+static VideoPortHdcpProtocolVersion aidlHdcpVersionToLegacy(
+    const DeviceSettingsAidl::HDCPProtocolVersion version)
+{
+    return version == DeviceSettingsAidl::HDCPProtocolVersion::VERSION_2_X
+        ? VideoPortHdcpProtocolVersion::DS_HDCP_VERSION_2X
+        : VideoPortHdcpProtocolVersion::DS_HDCP_VERSION_1X;
+}
+
+static HDRStandard aidlHdrModeToLegacy(const int mode)
+{
+    switch (mode) {
+        case 1: return HDRStandard::DS_HDRSTANDARD_HLG;
+        case 2: return HDRStandard::DS_HDRSTANDARD_HDR10;
+        case 3: return HDRStandard::DS_HDRSTANDARD_HDR10PLUS;
+        case 4: return HDRStandard::DS_HDRSTANDARD_DOLBYVISION;
+        default: return HDRStandard::DS_HDRSTANDARD_NONE;
+    }
+}
+
+static int legacyHdrModeToAidl(const HDRStandard mode)
+{
+    switch (mode) {
+        case HDRStandard::DS_HDRSTANDARD_HLG: return 1;
+        case HDRStandard::DS_HDRSTANDARD_HDR10: return 2;
+        case HDRStandard::DS_HDRSTANDARD_HDR10PLUS: return 3;
+        case HDRStandard::DS_HDRSTANDARD_DOLBYVISION: return 4;
+        default: return 0;
+    }
+}
+
+static uint32_t aidlHdrCapabilitiesToLegacy(const DeviceSettingsAidl::Capabilities& capabilities)
+{
+    uint32_t result = dsHDRSTANDARD_NONE;
+    for (const auto mode : capabilities.supportedHDROutputModes) {
+        switch (mode) {
+            case DeviceSettingsAidl::HDROutputMode::HLG: result |= dsHDRSTANDARD_HLG; break;
+            case DeviceSettingsAidl::HDROutputMode::HDR10: result |= dsHDRSTANDARD_HDR10; break;
+            case DeviceSettingsAidl::HDROutputMode::HDR10_PLUS: result |= dsHDRSTANDARD_HDR10PLUS; break;
+            case DeviceSettingsAidl::HDROutputMode::DOLBY_VISION: result |= dsHDRSTANDARD_DolbyVision; break;
+            default: break;
+        }
+    }
+    return result;
+}
+
+static uint32_t aidlColorDepthCapabilitiesToLegacy(const DeviceSettingsAidl::Capabilities& capabilities)
+{
+    uint32_t result = dsDISPLAY_COLORDEPTH_AUTO;
+    for (const int32_t depth : capabilities.supportedColorDepths) {
+        if (depth == 8) result |= dsDISPLAY_COLORDEPTH_8BIT;
+        if (depth == 10) result |= dsDISPLAY_COLORDEPTH_10BIT;
+        if (depth == 12) result |= dsDISPLAY_COLORDEPTH_12BIT;
+    }
+    return result;
+}
+
+static uint32_t aidlVicsToLegacyResolutions(const DeviceSettingsAidl::Capabilities& capabilities)
+{
+    uint32_t result = 0;
+    for (const auto vic : capabilities.supportedVICs) {
+        switch (static_cast<int>(vic)) {
+            case 1: case 2: case 3: result |= 0x000002; break;
+            case 17: case 18: result |= 0x000008; break;
+            case 4: case 19: case 41: case 47: result |= 0x000020; break;
+            case 5: case 16: case 31: case 32: case 33: case 34: result |= 0x000100; break;
+            case 93: case 94: case 95: case 96: case 97: result |= 0x010000; break;
+            default: break;
+        }
+    }
+    return result;
+}
 
 class dVideoPortImpl : public hal::dVideoPort::IPlatform {
 
@@ -140,6 +851,13 @@ public:
 
     void InitialiseHAL()
     {
+        if (DeviceSettingsAidl::acquire()) {
+            m_aidlEnabled = true;
+            getPersistenceValue();
+            videoPort_isPlatInitialized = 1;
+            return;
+        }
+
         // Note: videoPort_isInitialized should only be set in setAllCallbacks after callback registration
         // Don't set it here as it prevents callback registration condition from working
 
@@ -178,6 +896,14 @@ public:
 
     void DeInitialiseHAL()
     {
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::release();
+            m_aidlEnabled = false;
+            videoPort_isPlatInitialized = 0;
+            videoPort_isInitialized = 0;
+            return;
+        }
+
         if (videoPort_isPlatInitialized)
         {
             dsVideoPortTerm();
@@ -195,6 +921,16 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" videoPort=%d, index=%d", static_cast<int>(videoPort), index);
+
+        if (m_aidlEnabled) {
+            if (videoPort != VideoPortType::DS_VIDEO_PORT_TYPE_HDMI &&
+                videoPort != VideoPortType::DS_VIDEO_PORT_TYPE_INTERNAL) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            return DeviceSettingsAidl::getHandleByIndex(index, handle)
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         dsVideoPortType_t dsVideoPort = convertVideoPortType(videoPort);
         intptr_t dsHandle;
@@ -215,6 +951,12 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return DeviceSettingsAidl::getStarted(handle, enabled)
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         bool dsEnabled = false;
         dsError_t eError = dsIsVideoPortEnabled(handle, &dsEnabled);
@@ -233,6 +975,12 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, enabled=%s", handle, enabled ? "true" : "false");
+
+        if (m_aidlEnabled) {
+            return (enabled ? DeviceSettingsAidl::start(handle) : DeviceSettingsAidl::stop(handle))
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         dsError_t eError = dsEnableVideoPort(handle, enabled);
         if (eError == dsERR_NONE) {
@@ -249,6 +997,12 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return DeviceSettingsAidl::getHotPlugState(handle, connected)
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         bool dsConnected = false;
         dsError_t eError = dsIsDisplayConnected(handle, &dsConnected);
@@ -267,6 +1021,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         bool dsActive = false;
         dsError_t eError = dsIsVideoPortActive(handle, &dsActive);
@@ -285,6 +1043,19 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            std::optional<DeviceSettingsAidl::PropertyValue> propertyValue;
+            int32_t vic = 0;
+            dsVideoPortResolution_t dsResolution;
+            if (!DeviceSettingsAidl::getProperty(handle, DeviceSettingsAidl::Property::VIC, propertyValue) ||
+                !DeviceSettingsAidl::getIntProperty(propertyValue, vic)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            aidlVicToVideoPortResolution(vic, dsResolution);
+            resolution = convertVideoPortResolution(dsResolution);
+            return WPEFramework::Core::ERROR_NONE;
+        }
 
         dsVideoPortType_t portType = dsVIDEOPORT_TYPE_MAX;
         if (!resolvePortTypeByHandle(handle, portType)) {
@@ -339,6 +1110,10 @@ public:
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO("handle=%d", handle);
 
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
+
         typedef dsError_t (*dsGetIgnoreEDIDStatus_t)(intptr_t handle, bool* ignoreEDID);
         static dsGetIgnoreEDIDStatus_t dsGetIgnoreEDIDStatusFunc = nullptr;
 
@@ -367,6 +1142,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsGetColorDepth_t)(intptr_t handle, unsigned int* color_depth);
         static dsGetColorDepth_t dsGetColorDepthFunc = 0;
@@ -404,6 +1183,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, colorDepth=%u", handle, colorDepth);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         // Use dsSetPreferredColorDepth instead since dsSetVideoPortColorDepth may not exist
         dsDisplayColorDepth_t dsColorDepth = static_cast<dsDisplayColorDepth_t>(colorDepth);
@@ -422,6 +1205,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsGetQuantizationRange_t)(intptr_t handle, dsDisplayQuantizationRange_t* quantization_range);
         static dsGetQuantizationRange_t dsGetQuantizationRangeFunc = 0;
@@ -456,6 +1243,10 @@ public:
 
     uint32_t SetVideoPortQuantizationRange(const int32_t handle, const VideoPortQuantizationRange quantizationRange) override
     {
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
+
         // dsVideoPort.c has no dsSetQuantizationRange; quantization range is a read-only sink attribute
         DSLOG_WARN(" not supported by DS HAL (read-only sink property)");
         return WPEFramework::Core::ERROR_NONE;
@@ -465,6 +1256,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsGetColorSpace_t)(intptr_t handle, dsDisplayColorSpace_t* color_space);
         static dsGetColorSpace_t dsGetColorSpaceFunc = 0;
@@ -499,6 +1294,10 @@ public:
 
     uint32_t SetColorSpace(const int32_t handle, const VideoPortColorSpace colorSpace) override
     {
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
+
         // dsVideoPort.c has no dsSetColorSpace; color space is a read-only EDID-negotiated property
         DSLOG_WARN(" not supported by DS HAL (read-only sink property)");
         return WPEFramework::Core::ERROR_NONE;
@@ -508,6 +1307,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
 
         // No standalone dsGetFrameRate API; frame rate is embedded in the resolution name (e.g. "1080p60", "2160p30")
         dsVideoPortResolution_t dsResolution;
@@ -536,6 +1339,10 @@ public:
 
     uint32_t SetVideoPortFrameRate(const int32_t handle, const uint32_t frameRate) override
     {
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
+
         // No standalone dsSetFrameRate API; frame rate is set via dsSetResolution as part of the resolution name
         DSLOG_WARN(" not a separate HAL operation — frame rate is implicit in SetVideoPortResolution");
         return WPEFramework::Core::ERROR_NONE;
@@ -544,6 +1351,16 @@ public:
     uint32_t GetVideoPortHDCPStatus(const int32_t handle, VideoPortHdcpStatus& hdcpStatus) override
     {
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::HDCPStatus status;
+            if (!DeviceSettingsAidl::getHDCPStatus(handle, status)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            hdcpStatus = aidlHdcpStatusToLegacy(status);
+            return WPEFramework::Core::ERROR_NONE;
+        }
+
         hdcpStatus = convertHdcpStatus(static_cast<dsHdcpStatus_t>(cachedHdcpStatus().load()));
         DSLOG_INFO(" SUCCESS - cached status=%d", static_cast<int>(hdcpStatus));
         return WPEFramework::Core::ERROR_NONE;
@@ -553,6 +1370,16 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::Capabilities capabilities;
+            if (!DeviceSettingsAidl::getCapabilities(handle, capabilities) ||
+                capabilities.supportedHDCPProtocolVersions.empty()) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            hdcpVersion = aidlHdcpVersionToLegacy(capabilities.supportedHDCPProtocolVersions.front());
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetHDCPProtocol_t)(intptr_t handle, dsHdcpProtocolVersion_t* protocolVersion);
         static dsGetHDCPProtocol_t dsGetHDCPProtocolFunc = 0;
@@ -588,6 +1415,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::HDCPProtocolVersion version;
+            if (!DeviceSettingsAidl::getHDCPReceiverVersion(handle, version)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            hdcpVersion = aidlHdcpVersionToLegacy(version);
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetHDCPReceiverProtocol_t)(intptr_t handle, dsHdcpProtocolVersion_t* protocolVersion);
         static dsGetHDCPReceiverProtocol_t dsGetHDCPReceiverProtocolFunc = 0;
@@ -623,6 +1459,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::HDCPProtocolVersion version;
+            if (!DeviceSettingsAidl::getHDCPCurrentVersion(handle, version)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            hdcpVersion = aidlHdcpVersionToLegacy(version);
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetHDCPCurrentProtocol_t)(intptr_t handle, dsHdcpProtocolVersion_t* protocolVersion);
         static dsGetHDCPCurrentProtocol_t dsGetHDCPCurrentProtocolFunc = 0;
@@ -658,6 +1503,17 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            std::optional<DeviceSettingsAidl::PropertyValue> propertyValue;
+            int32_t mode = 0;
+            if (!DeviceSettingsAidl::getProperty(handle, DeviceSettingsAidl::Property::HDR_OUTPUT_MODE, propertyValue) ||
+                !DeviceSettingsAidl::getIntProperty(propertyValue, mode)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            hdrStandard = aidlHdrModeToLegacy(mode);
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetVideoEOTF_t)(intptr_t handle, dsHDRStandard_t* video_eotf);
         static dsGetVideoEOTF_t dsGetVideoEOTFFunc = 0;
@@ -694,6 +1550,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsGetMatrixCoefficients_t)(intptr_t handle, dsDisplayMatrixCoefficients_t* matrix_coefficients);
         static dsGetMatrixCoefficients_t dsGetMatrixCoefficientsFunc = 0;
@@ -802,6 +1662,21 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            std::optional<DeviceSettingsAidl::PropertyValue> propertyValue;
+            int32_t mode = 0;
+            if (!DeviceSettingsAidl::getProperty(handle, DeviceSettingsAidl::Property::HDR_OUTPUT_MODE, propertyValue) ||
+                !DeviceSettingsAidl::getIntProperty(propertyValue, mode)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            outputSettings.videoEotf = aidlHdrModeToLegacy(mode);
+            outputSettings.matrixCoefficients = DisplayMatrixCoefficients::DS_DISPLAY_MATRIXCOEFFICIENT_UNKNOWN;
+            outputSettings.colorDepth = 0;
+            outputSettings.colorSpace = VideoPortColorSpace::DS_DISPLAY_COLORSPACE_UNKNOWN;
+            outputSettings.quantizationRange = VideoPortQuantizationRange::DS_DISPLAY_QUANTIZATIONRANGE_UNKNOWN;
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetCurrentOutputSettings_t)(intptr_t handle, dsHDRStandard_t* video_eotf, dsDisplayMatrixCoefficients_t* matrix_coefficients, dsDisplayColorSpace_t* color_space, unsigned int* color_depth, dsDisplayQuantizationRange_t* quantization_range);
         static dsGetCurrentOutputSettings_t dsGetCurrentOutputSettingsFunc = 0;
@@ -854,6 +1729,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, persist=%s", handle, persist ? "true" : "false");
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         if (persist) {
             // Use persistent color depth - following dsVideoPort.c pattern
@@ -899,6 +1778,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, colorDepth=%d, persist=%s", handle, static_cast<int>(colorDepth), persist ? "true" : "false");
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
 
         // dsVideoPort.c setPreferredColorDepth: ignore the request entirely if the port isn't connected.
         bool isConnected = false;
@@ -954,6 +1837,25 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, persist=%s, forceCompatibility=%s", handle, persist ? "true" : "false", forceCompatibility ? "true" : "false");
+
+        if (m_aidlEnabled) {
+            const int vic = videoPortResolutionToAidlVic(resolution);
+            if (!DeviceSettingsAidl::setProperty(handle, DeviceSettingsAidl::Property::VIC,
+                    DeviceSettingsAidl::intProperty(vic))) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            if (persist) {
+                const dsVideoPortType_t portType = dsVIDEOPORT_TYPE_HDMI;
+                updateCachedResolutionForPort(portType, resolution.name);
+            }
+            if (g_VideoPortResolutionPreChangeCallback) {
+                g_VideoPortResolutionPreChangeCallback(resolution);
+            }
+            if (g_VideoPortResolutionPostChangeCallback) {
+                g_VideoPortResolutionPostChangeCallback(resolution);
+            }
+            return WPEFramework::Core::ERROR_NONE;
+        }
 
         dsVideoPortType_t portType = dsVIDEOPORT_TYPE_MAX;
         if (!resolvePortTypeByHandle(handle, portType)) {
@@ -1024,6 +1926,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, hdcpEnable=%s, hdcpKeySize=%u", handle, hdcpEnable ? "true" : "false", hdcpKeySize);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         dsError_t eError = dsEnableHDCP(handle, hdcpEnable, (char*)hdcpKey, static_cast<int>(hdcpKeySize));
         if (eError == dsERR_NONE) {
@@ -1040,6 +1946,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::HDCPStatus status;
+            if (!DeviceSettingsAidl::getHDCPStatus(handle, status)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            hdcpEnabled = status == DeviceSettingsAidl::HDCPStatus::AUTHENTICATED;
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         bool dsHdcpEnabled = false;
         dsError_t eError = dsIsHDCPEnabled(handle, &dsHdcpEnabled);
@@ -1058,6 +1973,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::Capabilities aidlCapabilities;
+            if (!DeviceSettingsAidl::getCapabilities(handle, aidlCapabilities)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            capabilities = static_cast<int32_t>(aidlHdrCapabilitiesToLegacy(aidlCapabilities));
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetTVHDRCapabilitiesFunc_t)(intptr_t handle, int* capabilities);
         static dsGetTVHDRCapabilitiesFunc_t dsGetTVHDRCapabilitiesFunc = 0;
@@ -1094,6 +2018,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::Capabilities aidlCapabilities;
+            if (!DeviceSettingsAidl::getCapabilities(handle, aidlCapabilities)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            resolutions = static_cast<int32_t>(aidlVicsToLegacyResolutions(aidlCapabilities));
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsSupportedTvResolutionsFunc_t)(intptr_t handle, int* resolutions);
         static dsSupportedTvResolutionsFunc_t dsSupportedTvResolutionsFunc = 0;
@@ -1130,6 +2063,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, disable=%s", handle, disable ? "true" : "false");
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         dsError_t eError = dsSetForceDisable4KSupport(handle, disable);
         if (eError == dsERR_NONE) {
@@ -1155,6 +2092,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         // Use correct DS HAL function: dsGetForceDisable4KSupport
         bool dsDisabled = false;
@@ -1175,6 +2116,17 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            std::optional<DeviceSettingsAidl::PropertyValue> propertyValue;
+            int32_t mode = 0;
+            if (!DeviceSettingsAidl::getProperty(handle, DeviceSettingsAidl::Property::HDR_OUTPUT_MODE, propertyValue) ||
+                !DeviceSettingsAidl::getIntProperty(propertyValue, mode)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            isHDR = mode != 0;
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsIsOutputHDR_t)(intptr_t handle, bool* isHDR);
         static dsIsOutputHDR_t dsIsOutputHDRFunc = 0;
@@ -1210,6 +2162,16 @@ public:
     uint32_t ResetVideoPortOutputToSDR() override
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
+
+        if (m_aidlEnabled) {
+            int handle = -1;
+            if (!DeviceSettingsAidl::getHandleByIndex(0, handle) ||
+                !DeviceSettingsAidl::setProperty(handle, DeviceSettingsAidl::Property::HDR_OUTPUT_MODE,
+                    DeviceSettingsAidl::intProperty(0))) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsResetOutputToSDR_t)(void);
         static dsResetOutputToSDR_t dsResetOutputToSDRFunc = 0;
@@ -1243,6 +2205,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsGetHdmiPreference_t)(intptr_t handle, dsHdcpProtocolVersion_t* hdcpVersion);
         static dsGetHdmiPreference_t dsGetHdmiPreferenceFunc = 0;
@@ -1278,6 +2244,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, hdcpVersion=%d", handle, static_cast<int>(hdcpVersion));
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsSetHdmiPreference_t)(intptr_t handle, dsHdcpProtocolVersion_t* hdcpVersion);
         static dsSetHdmiPreference_t dsSetHdmiPreferenceFunc = 0;
@@ -1312,6 +2282,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, backgroundColor=%d", handle, static_cast<int>(backgroundColor));
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         dsVideoBackgroundColor_t dsBackgroundColor = static_cast<dsVideoBackgroundColor_t>(backgroundColor);
         dsError_t eError = dsSetBackgroundColor(handle, dsBackgroundColor);
@@ -1329,6 +2303,13 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, hdrMode=%d", handle, static_cast<int>(hdrMode));
+
+        if (m_aidlEnabled) {
+            return DeviceSettingsAidl::setProperty(handle, DeviceSettingsAidl::Property::HDR_OUTPUT_MODE,
+                    DeviceSettingsAidl::intProperty(legacyHdrModeToAidl(hdrMode)))
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsSetForceHDRMode_t)(intptr_t handle, dsHDRStandard_t hdrMode);
         static dsSetForceHDRMode_t dsSetForceHDRModeFunc = 0;
@@ -1365,6 +2346,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::Capabilities aidlCapabilities;
+            if (!DeviceSettingsAidl::getCapabilities(handle, aidlCapabilities)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            colorDepthCapabilities = aidlColorDepthCapabilitiesToLegacy(aidlCapabilities);
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsColorDepthCapabilities_t)(intptr_t handle, unsigned int* colorDepthCapability);
         static dsColorDepthCapabilities_t dsColorDepthCapabilitiesFunc = 0;
@@ -1409,6 +2399,28 @@ public:
     {
         ENTRY_LOG;
         DSLOG_INFO("Registering event callbacks with DS HAL");
+
+        if (m_aidlEnabled) {
+            if (bundle.OnResolutionPreChange) {
+                g_VideoPortResolutionPreChangeCallback = bundle.OnResolutionPreChange;
+            }
+            if (bundle.OnResolutionPostChange) {
+                g_VideoPortResolutionPostChangeCallback = bundle.OnResolutionPostChange;
+            }
+            if (bundle.OnHDCPStatusChange) {
+                g_VideoPortHDCPStatusChangeCallback = bundle.OnHDCPStatusChange;
+            }
+            DeviceSettingsAidl::Callbacks callbacks;
+            callbacks.onHdcp = [](int, DeviceSettingsAidl::HDCPStatus status,
+                DeviceSettingsAidl::HDCPProtocolVersion) {
+                if (g_VideoPortHDCPStatusChangeCallback) {
+                    g_VideoPortHDCPStatusChangeCallback(aidlHdcpStatusToLegacy(status));
+                }
+            };
+            DeviceSettingsAidl::setCallbacks(callbacks);
+            videoPort_isInitialized = 1;
+            return;
+        }
         
         // Debug logging to diagnose condition failure
         DSLOG_INFO("VideoPort callback registration check: videoPort_isInitialized=%d, videoPort_isPlatInitialized=%d",
@@ -1833,6 +2845,8 @@ public:
     }
 
 private:
+
+    bool m_aidlEnabled{false};
 
     
     // Helper methods for DS VideoPort HAL conversion
