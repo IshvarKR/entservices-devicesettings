@@ -25,6 +25,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <cstring>
@@ -42,6 +43,192 @@
 #include <WPEFramework/interfaces/IDeviceSettingsVideoDevice.h>
 #include "DeviceSettingsTypes.h"
 
+#ifdef LOG_PRI
+#undef LOG_PRI
+#endif
+
+#include <binder/IServiceManager.h>
+#include <binder/ProcessState.h>
+#include <com/rdk/hal/PropertyValue.h>
+#include <com/rdk/hal/panel/IPanelOutput.h>
+#include <com/rdk/hal/videodecoder/Capabilities.h>
+#include <com/rdk/hal/videodecoder/IVideoDecoderManager.h>
+#include <com/rdk/hal/videodecoder/Property.h>
+#include <utils/String16.h>
+
+#include <array>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+namespace VideoDeviceAidl {
+
+using android::sp;
+using com::rdk::hal::PropertyValue;
+using com::rdk::hal::panel::Capabilities;
+using com::rdk::hal::panel::IPanelOutput;
+using com::rdk::hal::videodecoder::IVideoDecoder;
+using com::rdk::hal::videodecoder::IVideoDecoderManager;
+using com::rdk::hal::videodecoder::Property;
+using DecoderCapabilities = com::rdk::hal::videodecoder::Capabilities;
+
+inline std::mutex g_mutex;
+inline sp<IVideoDecoderManager> g_decoderManager;
+inline sp<IPanelOutput> g_panelOutput;
+inline std::map<int, sp<IVideoDecoder>> g_decoders;
+inline unsigned int g_references{0};
+
+inline bool initialize()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_decoderManager || g_panelOutput) {
+        return true;
+    }
+
+    ::android::ProcessState::self()->startThreadPool();
+    sp<::android::IServiceManager> serviceManager = ::android::defaultServiceManager();
+    if (!serviceManager) {
+        return false;
+    }
+
+    g_decoderManager = ::android::interface_cast<IVideoDecoderManager>(
+        serviceManager->getService(
+            ::android::String16(IVideoDecoderManager::serviceName().c_str())));
+    g_panelOutput = ::android::interface_cast<IPanelOutput>(
+        serviceManager->getService(
+            ::android::String16(IPanelOutput::serviceName().c_str())));
+
+    if (g_decoderManager) {
+        std::vector<IVideoDecoder::Id> ids;
+        if (g_decoderManager->getVideoDecoderIds(&ids).isOk()) {
+            for (const auto& id : ids) {
+                sp<IVideoDecoder> decoder;
+                if (g_decoderManager->getVideoDecoder(id, &decoder).isOk() && decoder) {
+                    g_decoders.emplace(id.value, decoder);
+                }
+            }
+        }
+    }
+
+    return !g_decoders.empty() || g_panelOutput != nullptr;
+}
+
+inline bool acquire()
+{
+    if (!initialize()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_references;
+    return true;
+}
+
+inline void release()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_references > 0) {
+        --g_references;
+    }
+    if (g_references == 0) {
+        g_decoders.clear();
+        g_decoderManager = nullptr;
+        g_panelOutput = nullptr;
+    }
+}
+
+inline bool getDecoderHandleByIndex(int index, int& handle)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (index < 0 || static_cast<size_t>(index) >= g_decoders.size()) {
+        return false;
+    }
+    auto it = g_decoders.begin();
+    std::advance(it, index);
+    handle = it->first;
+    return true;
+}
+
+inline bool getDecoder(int handle, sp<IVideoDecoder>& decoder)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_decoders.find(handle);
+    if (it == g_decoders.end()) {
+        return false;
+    }
+    decoder = it->second;
+    return true;
+}
+
+inline bool getDecoderCapabilities(int handle, DecoderCapabilities& capabilities)
+{
+    sp<IVideoDecoder> decoder;
+    return getDecoder(handle, decoder) && decoder->getCapabilities(&capabilities).isOk();
+}
+
+inline bool getDecoderProperty(int handle, Property property, std::optional<PropertyValue>& value)
+{
+    sp<IVideoDecoder> decoder;
+    return getDecoder(handle, decoder) && decoder->getProperty(property, &value).isOk() && value.has_value();
+}
+
+inline bool getPanel(sp<IPanelOutput>& panel)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    panel = g_panelOutput;
+    return panel != nullptr;
+}
+
+inline bool getPanelCapabilities(Capabilities& capabilities)
+{
+    sp<IPanelOutput> panel;
+    return getPanel(panel) && panel->getCapabilities(&capabilities).isOk();
+}
+
+inline bool getPanelEnabled(bool& enabled)
+{
+    sp<IPanelOutput> panel;
+    return getPanel(panel) && panel->getEnabled(&enabled).isOk();
+}
+
+inline bool setPanelEnabled(bool enabled)
+{
+    sp<IPanelOutput> panel;
+    return getPanel(panel) && panel->setEnabled(enabled).isOk();
+}
+
+inline bool getPanelRefreshRate(double& refreshRate)
+{
+    sp<IPanelOutput> panel;
+    return getPanel(panel) && panel->getRefreshRate(&refreshRate).isOk();
+}
+
+inline bool getPanelFrameRateMatching(bool& enabled)
+{
+    sp<IPanelOutput> panel;
+    return getPanel(panel) && panel->getFrameRateMatching(&enabled).isOk();
+}
+
+inline bool setPanelFrameRateMatching(bool enabled, bool& applied)
+{
+    sp<IPanelOutput> panel;
+    return getPanel(panel) && panel->setFrameRateMatching(enabled, &applied).isOk();
+}
+
+inline bool setPanelRefreshRate(double refreshRate, bool& applied)
+{
+    sp<IPanelOutput> panel;
+    return getPanel(panel) && panel->setRefreshRate(refreshRate, &applied).isOk();
+}
+
+inline bool getPanelFrameRate(std::array<int32_t, 2>& frameRate)
+{
+    sp<IPanelOutput> panel;
+    return getPanel(panel) && panel->getVideoFrameRate(&frameRate).isOk();
+}
+
+} // namespace VideoDeviceAidl
+
 // Static global variables from dsVideoDevice.c conversion
 static int videoDevice_isInitialized = 0;
 static int videoDevice_isPlatInitialized = 0;
@@ -52,6 +239,35 @@ static bool force_disable_hdr = true;
 static std::function<void(const VideoDeviceZoom)> g_VideoDeviceZoomSettingsChangedCallback;
 static std::function<void(const string)> g_VideoDeviceDisplayFrameratePreChangeCallback;
 static std::function<void(const string)> g_VideoDeviceDisplayFrameratePostChangeCallback;
+
+static int32_t aidlDecoderHdrCapabilitiesToLegacy(const VideoDeviceAidl::DecoderCapabilities& capabilities)
+{
+    int32_t result = dsHDRSTANDARD_NONE;
+    for (const auto range : capabilities.supportedDynamicRanges) {
+        switch (range) {
+            case com::rdk::hal::videodecoder::DynamicRange::HLG: result |= dsHDRSTANDARD_HLG; break;
+            case com::rdk::hal::videodecoder::DynamicRange::HDR10: result |= dsHDRSTANDARD_HDR10; break;
+            case com::rdk::hal::videodecoder::DynamicRange::HDR10_PLUS: result |= dsHDRSTANDARD_HDR10PLUS; break;
+            case com::rdk::hal::videodecoder::DynamicRange::DOLBY_VISION: result |= dsHDRSTANDARD_DolbyVision; break;
+            default: break;
+        }
+    }
+    return result;
+}
+
+static int32_t aidlDecoderCodecCapabilitiesToLegacy(const VideoDeviceAidl::DecoderCapabilities& capabilities)
+{
+    int32_t result = 0;
+    for (const auto& codec : capabilities.supportedCodecs) {
+        switch (codec.codec) {
+            case com::rdk::hal::videodecoder::Codec::H265_HEVC: result |= dsVIDEO_CODEC_MPEGHPART2; break;
+            case com::rdk::hal::videodecoder::Codec::H264_AVC: result |= dsVIDEO_CODEC_MPEG4PART10; break;
+            case com::rdk::hal::videodecoder::Codec::MPEG2_VIDEO: result |= dsVIDEO_CODEC_MPEG2; break;
+            default: break;
+        }
+    }
+    return result;
+}
 
 class dVideoDeviceImpl : public hal::dVideoDevice::IPlatform {
 
@@ -81,6 +297,12 @@ public:
 
     void InitialiseHAL()
     {
+        if (VideoDeviceAidl::acquire()) {
+            m_aidlEnabled = true;
+            videoDevice_isPlatInitialized = 1;
+            return;
+        }
+
         // Note: videoDevice_isInitialized should only be set in setAllCallbacks after callback registration
         // Don't set it here as it prevents callback registration condition from working
 
@@ -104,6 +326,14 @@ public:
 
     void DeInitialiseHAL()
     {
+        if (m_aidlEnabled) {
+            VideoDeviceAidl::release();
+            m_aidlEnabled = false;
+            videoDevice_isPlatInitialized = 0;
+            videoDevice_isInitialized = 0;
+            return;
+        }
+
         if (videoDevice_isPlatInitialized)
         {
             dsVideoDeviceTerm();
@@ -136,6 +366,12 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" index=%d", index);
+
+        if (m_aidlEnabled) {
+            return VideoDeviceAidl::getDecoderHandleByIndex(index, handle)
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         // Use intptr_t locally for HAL call - dsGetVideoDevice expects intptr_t*
         intptr_t halHandle = 0;
@@ -155,6 +391,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, zoomSetting=%d", handle, static_cast<int>(zoomSetting));
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         // Convert VideoDeviceZoom to dsVideoZoom_t
         dsVideoZoom_t dsZoom = convertVideoDeviceZoom(zoomSetting);
@@ -230,6 +470,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         // Return the cached zoom setting
         zoomSetting = convertDSVideoZoom(srv_dfc);
@@ -243,6 +487,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            VideoDeviceAidl::DecoderCapabilities aidlCapabilities;
+            if (!VideoDeviceAidl::getDecoderCapabilities(handle, aidlCapabilities)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            capabilities = aidlDecoderHdrCapabilitiesToLegacy(aidlCapabilities);
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetHDRCapabilitiesFunc_t)(intptr_t handle, int *capabilities);
         static dsGetHDRCapabilitiesFunc_t func = 0;
@@ -278,6 +531,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            VideoDeviceAidl::DecoderCapabilities aidlCapabilities;
+            if (!VideoDeviceAidl::getDecoderCapabilities(handle, aidlCapabilities)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            supportedFormats = aidlDecoderCodecCapabilitiesToLegacy(aidlCapabilities);
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetSupportedVideoCodingFormatsFunc_t)(intptr_t handle, unsigned int *supported_formats);
         static dsGetSupportedVideoCodingFormatsFunc_t func = 0;
@@ -313,6 +575,11 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, videoCodec=%d", handle, static_cast<int>(videoCodec));
+
+        if (m_aidlEnabled) {
+            codecInfo = nullptr;
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsGetVideoCodecInfoFunc_t)(intptr_t handle, dsVideoCodingFormat_t codec, dsVideoCodecInfo_t * info);
         static dsGetVideoCodecInfoFunc_t func = 0;
@@ -349,6 +616,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, disable=%s", handle, disable ? "true" : "false");
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsDisableHDRSupportFunc_t)(intptr_t handle, bool enable);
         static dsDisableHDRSupportFunc_t func = 0;
@@ -387,6 +658,13 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, frfmode=%d", handle, frfmode);
+
+        if (m_aidlEnabled) {
+            bool applied = false;
+            return VideoDeviceAidl::setPanelFrameRateMatching(frfmode != 0, applied) && applied
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsSetFRFModeFunc_t)(intptr_t handle, int frfmode);
         static dsSetFRFModeFunc_t func = 0;
@@ -416,6 +694,15 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            bool enabled = false;
+            if (!VideoDeviceAidl::getPanelFrameRateMatching(enabled)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            frfmode = enabled ? 1 : 0;
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetFRFModeFunc_t)(intptr_t handle, int *frfmode);
         static dsGetFRFModeFunc_t func = 0;
@@ -447,6 +734,20 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            std::array<int32_t, 2> frameRate{};
+            if (!VideoDeviceAidl::getPanelFrameRate(frameRate) || frameRate[1] == 0) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            const double value = static_cast<double>(frameRate[0]) / frameRate[1];
+            std::ostringstream stream;
+            stream << std::fixed << std::setprecision(3) << value;
+            framerate = stream.str();
+            while (!framerate.empty() && framerate.back() == '0') framerate.pop_back();
+            if (!framerate.empty() && framerate.back() == '.') framerate.pop_back();
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         typedef dsError_t (*dsGetCurrentDisframerateFunc_t)(intptr_t handle, char *framerate);
         static dsGetCurrentDisframerateFunc_t func = 0;
@@ -478,6 +779,26 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, framerate=%s", handle, framerate.c_str());
+
+        if (m_aidlEnabled) {
+            if (framerate.empty()) {
+                return WPEFramework::Core::ERROR_BAD_REQUEST;
+            }
+            char* end = nullptr;
+            const double refreshRate = std::strtod(framerate.c_str(), &end);
+            if (end == framerate.c_str() || *end != '\0' || refreshRate <= 0.0) {
+                return WPEFramework::Core::ERROR_BAD_REQUEST;
+            }
+            if (g_VideoDeviceDisplayFrameratePreChangeCallback) {
+                g_VideoDeviceDisplayFrameratePreChangeCallback(framerate);
+            }
+            bool applied = false;
+            const bool result = VideoDeviceAidl::setPanelRefreshRate(refreshRate, applied) && applied;
+            if (result && g_VideoDeviceDisplayFrameratePostChangeCallback) {
+                g_VideoDeviceDisplayFrameratePostChangeCallback(framerate);
+            }
+            return result ? WPEFramework::Core::ERROR_NONE : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         typedef dsError_t (*dsSetDisplayframerateFunc_t)(intptr_t handle, char *frfmode);
         static dsSetDisplayframerateFunc_t func = 0;
@@ -530,6 +851,14 @@ public:
     {
         ENTRY_LOG;
         DSLOG_INFO("Registering event callbacks with DS HAL");
+
+        if (m_aidlEnabled) {
+            g_VideoDeviceZoomSettingsChangedCallback = bundle.OnZoomSettingsChanged;
+            g_VideoDeviceDisplayFrameratePreChangeCallback = bundle.OnDisplayFrameratePreChange;
+            g_VideoDeviceDisplayFrameratePostChangeCallback = bundle.OnDisplayFrameratePostChange;
+            videoDevice_isInitialized = 1;
+            return;
+        }
         
         // Debug logging to diagnose condition failure
         DSLOG_INFO("VideoDevice callback registration check: videoDevice_isInitialized=%d, videoDevice_isPlatInitialized=%d",
@@ -710,6 +1039,8 @@ public:
     }
 
 private:
+    bool m_aidlEnabled{false};
+
     
     // Helper methods for DS VideoDevice HAL conversion
     dsVideoZoom_t convertVideoDeviceZoom(const VideoDeviceZoom zoom)
