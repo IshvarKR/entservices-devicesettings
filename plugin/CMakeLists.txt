@@ -134,19 +134,36 @@ target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${IARMBUS_LIBRARIES})
 # AIDL / binder includes — mirrors AIDL_INCLUDE in the old-arch Makefile
 find_path(AIDL_INCLUDE_DIR NAMES com/rdk/hal/hdmiinput/IHDMIInputManager.h
     PATH_SUFFIXES rdk-halif-aidl)
+find_path(AIDL_OUTPUT_INCLUDE_DIR NAMES com/rdk/hal/hdmioutput/IHDMIOutputManager.h
+    PATH_SUFFIXES rdk-halif-aidl hdmioutput/0.1.0.0/include hdmioutput/current/include)
+find_path(AIDL_COMMON_INCLUDE_DIR NAMES com/rdk/hal/PropertyValue.h
+    PATH_SUFFIXES rdk-halif-aidl common/0.2.0.0/include common/current/include)
+find_path(AIDL_PANEL_INCLUDE_DIR NAMES com/rdk/hal/panel/IPanelOutput.h
+    PATH_SUFFIXES rdk-halif-aidl panel/0.1.0.0/include panel/current/include)
+find_path(AIDL_VIDEODECODER_INCLUDE_DIR NAMES com/rdk/hal/videodecoder/IVideoDecoderManager.h
+    PATH_SUFFIXES rdk-halif-aidl videodecoder/0.2.0.1/include videodecoder/0.1.0.0/include videodecoder/current/include)
 find_path(BINDER_INCLUDE_DIR NAMES binder/IServiceManager.h
     PATH_SUFFIXES binder_sdk android)
-if(AIDL_INCLUDE_DIR AND BINDER_INCLUDE_DIR)
+if(AIDL_INCLUDE_DIR AND AIDL_OUTPUT_INCLUDE_DIR AND AIDL_COMMON_INCLUDE_DIR AND
+   AIDL_PANEL_INCLUDE_DIR AND AIDL_VIDEODECODER_INCLUDE_DIR AND BINDER_INCLUDE_DIR)
     target_include_directories(${PLUGIN_IMPLEMENTATION} PRIVATE
         ${AIDL_INCLUDE_DIR}
+        ${AIDL_OUTPUT_INCLUDE_DIR}
+        ${AIDL_COMMON_INCLUDE_DIR}
+        ${AIDL_PANEL_INCLUDE_DIR}
+        ${AIDL_VIDEODECODER_INCLUDE_DIR}
         ${BINDER_INCLUDE_DIR})
 else()
-    message(WARNING "AIDL or binder headers not found — AIDL path in dHdmiInImpl will be inactive")
+    message(WARNING "AIDL or binder headers not found — AIDL paths will be inactive")
 endif()
 
 find_library(BINDER_LIBRARY NAMES binder)
 find_library(UTILS_LIBRARY  NAMES utils)
 find_library(HAL_AIDL_LIBRARY NAMES hal_aidl)
+find_library(COMMON_AIDL_LIBRARY NAMES common-v0.2.0.0-cpp common-vcurrent-cpp)
+find_library(HDMIOUTPUT_AIDL_LIBRARY NAMES hdmioutput-v0.1.0.0-cpp hdmioutput-vcurrent-cpp)
+find_library(PANEL_AIDL_LIBRARY NAMES panel-v0.1.0.0-cpp panel-vcurrent-cpp)
+find_library(VIDEODECODER_AIDL_LIBRARY NAMES videodecoder-v0.2.0.1-cpp videodecoder-v0.1.0.0-cpp videodecoder-vcurrent-cpp)
 if(BINDER_LIBRARY)
     target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${BINDER_LIBRARY})
 endif()
@@ -155,6 +172,18 @@ if(UTILS_LIBRARY)
 endif()
 if(HAL_AIDL_LIBRARY)
     target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${HAL_AIDL_LIBRARY})
+endif()
+if(COMMON_AIDL_LIBRARY)
+    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${COMMON_AIDL_LIBRARY})
+endif()
+if(HDMIOUTPUT_AIDL_LIBRARY)
+    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${HDMIOUTPUT_AIDL_LIBRARY})
+endif()
+if(PANEL_AIDL_LIBRARY)
+    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${PANEL_AIDL_LIBRARY})
+endif()
+if(VIDEODECODER_AIDL_LIBRARY)
+    target_link_libraries(${PLUGIN_IMPLEMENTATION} PRIVATE ${VIDEODECODER_AIDL_LIBRARY})
 endif()
 
 # Binder/AIDL headers are pulled in through dHdmiInImpl.h, so the full
