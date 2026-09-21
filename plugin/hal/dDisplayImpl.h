@@ -111,6 +111,12 @@ public:
 
     void InitialiseHAL()
     {
+        if (DeviceSettingsAidl::acquire()) {
+            m_aidlEnabled = true;
+            display_isPlatInitialized = 1;
+            return;
+        }
+
         
         if (!display_isPlatInitialized) {
             DSLOG_INFO("<dsDisplay>");
@@ -132,6 +138,14 @@ public:
 
     void DeInitialiseHAL()
     {
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::release();
+            m_aidlEnabled = false;
+            display_isPlatInitialized = 0;
+            display_isInitialized = 0;
+            return;
+        }
+
         if (display_isPlatInitialized)
         {
             dsDisplayTerm();
@@ -172,6 +186,12 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" videoPortHandle=%d", videoPortHandle);
+
+        if (m_aidlEnabled) {
+            return DeviceSettingsAidl::getHotPlugState(videoPortHandle, isConnected)
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         pthread_mutex_lock(&dsDisplayLock);
         
@@ -239,6 +259,15 @@ public:
             DSLOG_ERR(" FAILED - Invalid parameters");
             return WPEFramework::Core::ERROR_BAD_REQUEST;
         }
+
+        if (m_aidlEnabled) {
+            std::vector<uint8_t> edid;
+            if (!DeviceSettingsAidl::getEdid(videoPortHandle, edid) || edid.size() > edidBytesLength) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            memcpy(edidBytes, edid.data(), edid.size());
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         pthread_mutex_lock(&dsDisplayLock);
         
@@ -274,6 +303,15 @@ public:
         if (edIdBytes == nullptr || edidLength == 0) {
             DSLOG_ERR(" FAILED - Invalid parameters");
             return retCode;
+        }
+
+        if (m_aidlEnabled) {
+            std::vector<uint8_t> edid;
+            if (!DeviceSettingsAidl::getEdid(handle, edid) || edid.size() > edidLength) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            memcpy(edIdBytes, edid.data(), edid.size());
+            return WPEFramework::Core::ERROR_NONE;
         }
 
         /* Mirror dsDisplay.c _dsGetEDIDBytes: serve from cache if available
@@ -329,6 +367,15 @@ public:
             return WPEFramework::Core::ERROR_BAD_REQUEST;
         }
 
+        if (m_aidlEnabled) {
+            if (type != dsVIDEOPORT_TYPE_HDMI && type != dsVIDEOPORT_TYPE_INTERNAL) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            return DeviceSettingsAidl::getHandleByIndex(index, handle)
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
+
         // Initialize handle to safe value
         handle = -1;
 
@@ -369,6 +416,21 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
+
+        if (m_aidlEnabled) {
+            std::optional<DeviceSettingsAidl::PropertyValue> propertyValue;
+            int32_t vic = 0;
+            dsVideoPortResolution_t resolution;
+            if (!DeviceSettingsAidl::getProperty(handle, DeviceSettingsAidl::Property::VIC, propertyValue) ||
+                !DeviceSettingsAidl::getIntProperty(propertyValue, vic)) {
+                return WPEFramework::Core::ERROR_UNAVAILABLE;
+            }
+            aidlVicToVideoPortResolution(vic, resolution);
+            aspectRatio = resolution.aspectRatio == dsVIDEO_ASPECT_RATIO_4x3
+                ? DisplayVideoAspectRatio::DS_DISPLAY_ASPECT_RATIO_4X3
+                : DisplayVideoAspectRatio::DS_DISPLAY_ASPECT_RATIO_16X9;
+            return WPEFramework::Core::ERROR_NONE;
+        }
         
         pthread_mutex_lock(&dsDisplayLock);
         
@@ -395,6 +457,10 @@ public:
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d", handle);
         supportedResolutionList = nullptr;
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
 
         /* Mirror dsDisplay.c _dsGetEDID: serve from cache when available.
          * Cache is reset to false on dsDISPLAY_EVENT_DISCONNECTED. */
@@ -583,6 +649,10 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, enabled=%s", handle, enabled ? "true" : "false");
+
+        if (m_aidlEnabled) {
+            return WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         pthread_mutex_lock(&dsDisplayLock);
         
@@ -629,6 +699,13 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, contentType=%d", handle, contentType);
+
+        if (m_aidlEnabled) {
+            return DeviceSettingsAidl::setProperty(handle, DeviceSettingsAidl::Property::CONTENT_TYPE,
+                    DeviceSettingsAidl::intProperty(contentType))
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         pthread_mutex_lock(&dsDisplayLock);
         
@@ -675,6 +752,13 @@ public:
     {
         uint32_t retCode = WPEFramework::Core::ERROR_GENERAL;
         DSLOG_INFO(" handle=%d, scanInfo=%d", handle, scanInfo);
+
+        if (m_aidlEnabled) {
+            return DeviceSettingsAidl::setProperty(handle, DeviceSettingsAidl::Property::SCAN_INFORMATION,
+                    DeviceSettingsAidl::intProperty(scanInfo))
+                ? WPEFramework::Core::ERROR_NONE
+                : WPEFramework::Core::ERROR_UNAVAILABLE;
+        }
         
         pthread_mutex_lock(&dsDisplayLock);
         
@@ -718,8 +802,27 @@ public:
     }
 
 private:
+    bool m_aidlEnabled{false};
+
     void registerDisplayEventCallbacks()
     {
+        if (m_aidlEnabled) {
+            DeviceSettingsAidl::Callbacks callbacks;
+            callbacks.onHotPlug = [](int handle, bool connected) {
+                if (g_DisplayHDMIHotPlugCallback) {
+                    g_DisplayHDMIHotPlugCallback(static_cast<uint8_t>(handle), connected);
+                }
+            };
+            callbacks.onHdcp = [](int handle, DeviceSettingsAidl::HDCPStatus status,
+                DeviceSettingsAidl::HDCPProtocolVersion) {
+                if (g_DisplayHDCPStatusCallback) {
+                    g_DisplayHDCPStatusCallback(static_cast<uint8_t>(handle), static_cast<int32_t>(status));
+                }
+            };
+            DeviceSettingsAidl::setCallbacks(callbacks);
+            return;
+        }
+
         
         // Use direct calls matching dsDisplay.c _dsDisplayInit pattern
         intptr_t handle = 0;
